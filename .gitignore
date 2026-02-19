@@ -1,0 +1,8 @@
+archive/*
+*.md
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.cache/
