@@ -4,8 +4,8 @@ import csv
 
 import torch as th
 
-from new_project.src.obs.detector_operator import detector_outputs_at_times
-from new_project.src.sim.topology import compute_leader_idx_per_lane
+from src.obs.detector_operator import detector_outputs_at_times
+from src.sim.topology import compute_leader_idx_per_lane
 
 FT2M = 0.3048
 

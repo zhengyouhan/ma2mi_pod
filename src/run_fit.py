@@ -6,10 +6,11 @@ import os
 
 import torch as th
 
-from new_project.src.data.ngsim_loader import load_ngsim_detector_dataset
-from new_project.src.graph_prior import laplacian_penalty
-from new_project.src.obs.detector_operator import detector_outputs_at_times
-from new_project.src.sim.rollout import rollout_idm_multilane
+from src.data.ngsim_loader import load_ngsim_detector_dataset
+from src.graph_prior import laplacian_penalty
+from src.loss import detector_loss
+from src.obs.detector_operator import detector_crosslane_at_times
+from src.sim.rollout import rollout_idm_multilane
 
 
 def _smoothness_stat(T: th.Tensor, leader_idx: th.Tensor, lane_id: th.Tensor) -> float:
@@ -21,13 +22,6 @@ def _smoothness_stat(T: th.Tensor, leader_idx: th.Tensor, lane_id: th.Tensor) ->
         i = th.where(valid)[0]
         j = leader_idx[i]
         return float((T[i] - T[j]).abs().mean().item())
-
-
-def _masked_mse(a: th.Tensor, b: th.Tensor) -> th.Tensor:
-    m = th.isfinite(a) & th.isfinite(b)
-    if m.sum() == 0:
-        return th.zeros((), device=a.device, dtype=a.dtype)
-    return ((a[m] - b[m]) ** 2).mean()
 
 
 def fit_once(data: dict, cfg: argparse.Namespace, lambda_T: float) -> dict:
@@ -91,9 +85,10 @@ def fit_once(data: dict, cfg: argparse.Namespace, lambda_T: float) -> dict:
             ghost_gap0=cfg.ghost_gap0,
         )
 
-        pred = detector_outputs_at_times(
+        pred = detector_crosslane_at_times(
             S=S,
             V=V,
+            lane_id=lane_id,
             xq=xq,
             x_dets=x_dets,
             time_indices=time_idx,
@@ -101,9 +96,13 @@ def fit_once(data: dict, cfg: argparse.Namespace, lambda_T: float) -> dict:
             half_window=10.0,
         )
 
-        L_k = _masked_mse(pred["density"], obs["density"])
-        L_v = _masked_mse(pred["speed"], obs["speed"])
-        L_det = L_k + cfg.speed_weight * L_v
+        L_det = detector_loss(
+            pred=pred,
+            obs=obs,
+            weights={"flow": 1.0, "speed": cfg.speed_weight},
+            loss_type="huber",
+            huber_delta=1.0,
+        )
 
         if cfg.state_weighted_graph:
             weights = (1.0 / (1.0 + V[0].detach())).to(dtype)

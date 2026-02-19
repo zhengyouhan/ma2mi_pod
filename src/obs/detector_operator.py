@@ -150,3 +150,136 @@ def detector_outputs_at_times(
         L_eff=L_eff,
     )
     return {k: v[time_indices] for k, v in det_ts.items()}
+
+
+def detector_crosslane_aggregate(
+    S: th.Tensor,
+    V: th.Tensor,
+    lane_id: th.Tensor,
+    xq: th.Tensor,
+    x_dets: list[float],
+    *,
+    sigma: float,
+    half_window: float = 10.0,
+    eps: float = 1e-6,
+) -> dict[str, th.Tensor]:
+    """
+    Cross-lane aggregated detector outputs.
+
+    For each detector:
+    1. Compute per-lane macro fields: rho_ℓ, u_ℓ, q_ℓ
+    2. Aggregate across lanes:
+       - q_tot = Σ_ℓ q_ℓ
+       - rho_tot = Σ_ℓ rho_ℓ
+       - v_tot = (Σ_ℓ q_ℓ · v_ℓ) / (q_tot + eps)  [flow-weighted]
+
+    Args:
+        S: [T, N] positions
+        V: [T, N] velocities
+        lane_id: [N] lane ID per vehicle
+        xq: [M] spatial query grid
+        x_dets: detector positions
+        sigma: Gaussian kernel width
+        half_window: spatial window half-width for detector averaging
+        eps: small value to avoid division by zero
+
+    Returns:
+        {"flow": [T, Nd], "speed": [T, Nd], "density": [T, Nd]}
+    """
+    if S.shape != V.shape or S.ndim != 2:
+        raise ValueError("S and V must have shape [T, N]")
+    if lane_id.shape[0] != S.shape[1]:
+        raise ValueError("lane_id must have length N")
+
+    T, _ = S.shape
+    M = xq.shape[0]
+    Nd = len(x_dets)
+    device, dtype = S.device, S.dtype
+
+    unique_lanes = th.unique(lane_id)
+
+    # Per-lane macro fields: [num_lanes, T, M]
+    rho_per_lane = []
+    u_per_lane = []
+    q_per_lane = []
+
+    for lane in unique_lanes:
+        mask = lane_id == lane
+        n_lane = mask.sum().item()
+
+        if n_lane == 0:
+            # Empty lane: zeros
+            rho_per_lane.append(th.zeros((T, M), device=device, dtype=dtype))
+            u_per_lane.append(th.zeros((T, M), device=device, dtype=dtype))
+            q_per_lane.append(th.zeros((T, M), device=device, dtype=dtype))
+        else:
+            S_lane = S[:, mask]
+            V_lane = V[:, mask]
+            rho_l, u_l, q_l = micro_to_macro_gaussian(S_lane, V_lane, xq, sigma=sigma)
+            rho_per_lane.append(rho_l)
+            u_per_lane.append(u_l)
+            q_per_lane.append(q_l)
+
+    # Stack: [num_lanes, T, M]
+    rho_stack = th.stack(rho_per_lane, dim=0)
+    u_stack = th.stack(u_per_lane, dim=0)
+    q_stack = th.stack(q_per_lane, dim=0)
+
+    # Aggregate across lanes: [T, M]
+    rho_tot = rho_stack.sum(dim=0)
+    q_tot = q_stack.sum(dim=0)
+
+    # Flow-weighted speed: v_tot = (Σ_ℓ q_ℓ · v_ℓ) / (q_tot + eps)
+    qv_sum = (q_stack * u_stack).sum(dim=0)
+    u_tot = _soft_conditional(
+        condition_value=q_tot,
+        threshold=eps,
+        safe_value=th.zeros_like(q_tot),
+        computed_value=qv_sum / (q_tot + eps),
+        beta=20.0,
+    )
+
+    # Extract detector values
+    flow = th.zeros((T, Nd), device=device, dtype=dtype)
+    speed = th.zeros((T, Nd), device=device, dtype=dtype)
+    density = th.zeros((T, Nd), device=device, dtype=dtype)
+
+    for j, xd in enumerate(x_dets):
+        win = (xq >= xd - half_window) & (xq <= xd + half_window)
+        idx = th.where(win)[0]
+        if idx.numel() == 0:
+            raise ValueError(f"Detector window at x={xd:.2f} has no grid points")
+
+        flow[:, j] = q_tot[:, idx].mean(dim=1)
+        speed[:, j] = u_tot[:, idx].mean(dim=1)
+        density[:, j] = rho_tot[:, idx].mean(dim=1)
+
+    return {"flow": flow, "speed": speed, "density": density}
+
+
+def detector_crosslane_at_times(
+    S: th.Tensor,
+    V: th.Tensor,
+    lane_id: th.Tensor,
+    xq: th.Tensor,
+    x_dets: list[float],
+    time_indices: th.Tensor,
+    *,
+    sigma: float,
+    half_window: float = 10.0,
+) -> dict[str, th.Tensor]:
+    """
+    Cross-lane aggregated detector outputs at selected time indices.
+
+    Returned shapes are [K, Nd], where K = len(time_indices).
+    """
+    det_ts = detector_crosslane_aggregate(
+        S=S,
+        V=V,
+        lane_id=lane_id,
+        xq=xq,
+        x_dets=x_dets,
+        sigma=sigma,
+        half_window=half_window,
+    )
+    return {k: v[time_indices] for k, v in det_ts.items()}
