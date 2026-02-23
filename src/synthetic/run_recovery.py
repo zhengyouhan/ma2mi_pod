@@ -29,6 +29,18 @@ from src.wavefront_loss import (
     compute_wavefront_gating,
     wavefront_gated_laplacian_penalty,
 )
+from src.pde_constraint import aggregate_macro_fields, continuity_loss
+from src.aggregation import GraphAggregator
+from src.aggregation.wave_energy import (
+    compute_wave_energy_direct,
+    detect_wave_active_windows,
+    wave_energy_loss_correlation,
+)
+from src.aggregation.lag_speed import (
+    detect_wave_windows,
+    estimate_wave_speed,
+    lag_loss,
+)
 
 
 def fit_T(data: dict, cfg: WaveScenarioConfig, lambda_T: float = 0.01, iters: int = 100, lr: float = 0.05):
@@ -282,6 +294,473 @@ def fit_T_with_wavefront(
     return T_est, history
 
 
+def fit_T_with_pde(
+    data: dict,
+    cfg: WaveScenarioConfig,
+    lambda_T: float = 0.01,
+    beta_cont: float = 0.001,
+    iters: int = 100,
+    lr: float = 0.05,
+    boundary_cells: int = 5,
+    warmup_frac: float = 0.3,
+):
+    """Fit T parameters with PDE (continuity) constraint."""
+    device = data["s0"].device
+    dtype = data["s0"].dtype
+    N = data["s0"].shape[0]
+
+    s0 = data["s0"]
+    v0 = data["v0"]
+    lane_id = data["lane_id"]
+    leader_idx = data["leader_idx"]
+    xq = data["xq"]
+    x_dets = data["x_dets"]
+    time_idx = data["time_idx_5s"]
+    obs = data["obs_5s"]
+
+    steps = int(cfg.duration_s / cfg.dt)
+
+    # Compute dx from spatial grid
+    dx = float(xq[1] - xq[0])
+
+    # Initialize T with prior mean
+    T_min, T_max = cfg.T_min, cfg.T_max
+    u_T = th.nn.Parameter(inverse_sigmoid_reparam(
+        th.full((N,), cfg.T_mean, device=device, dtype=dtype),
+        T_min, T_max
+    ))
+
+    opt = th.optim.Adam([u_T], lr=lr)
+
+    a_max = th.full((N,), cfg.a_max, device=device, dtype=dtype)
+    b = th.full((N,), cfg.b_comfort, device=device, dtype=dtype)
+    v_target = th.full((N,), cfg.v_free, device=device, dtype=dtype)
+
+    history = {
+        "loss": [], "L_det": [], "L_graph": [], "L_cont": [],
+        "T_std": [],
+    }
+
+    warmup_iters = int(iters * warmup_frac)
+    print(f"Fitting T with PDE constraint: lambda_T={lambda_T}, beta_cont={beta_cont}")
+    print(f"  Stage A (L_det only): iters 0-{warmup_iters-1}")
+    print(f"  Stage B (+ continuity): iters {warmup_iters}-{iters-1}")
+    print(f"  dx={dx:.2f}m, dt={cfg.dt}s, boundary_cells={boundary_cells}")
+
+    for i in range(iters):
+        opt.zero_grad()
+
+        use_pde = (i >= warmup_iters)
+
+        T = sigmoid_reparam(u_T, T_min, T_max)
+
+        S, V, _ = rollout_idm_multilane(
+            s0_init=s0,
+            v0_init=v0,
+            leader_idx=leader_idx,
+            num_steps=steps,
+            dt=cfg.dt,
+            a_max=a_max,
+            b=b,
+            v_target=v_target,
+            s0=cfg.s0,
+            T_headway=T,
+            ghost_v=cfg.ghost_v_base,
+            ghost_gap0=cfg.ghost_gap0,
+        )
+
+        pred = detector_crosslane_at_times(
+            S=S, V=V, lane_id=lane_id, xq=xq, x_dets=x_dets,
+            time_indices=time_idx, sigma=cfg.sigma, half_window=10.0,
+        )
+
+        # Detector loss
+        L_det = detector_loss(
+            pred=pred, obs=obs,
+            weights={"flow": 1.0, "speed": 0.1},
+            loss_type="huber", huber_delta=1.0,
+        )
+
+        # PDE (continuity) constraint (after warmup)
+        if use_pde:
+            macro = aggregate_macro_fields(S, V, lane_id, xq, sigma=cfg.sigma)
+            L_cont = continuity_loss(
+                macro["rho"], macro["q"],
+                dt=cfg.dt, dx=dx, boundary_cells=boundary_cells,
+            )
+        else:
+            L_cont = th.tensor(0.0, device=device, dtype=dtype)
+
+        # Graph regularization
+        L_graph = laplacian_penalty(T, leader_idx, lane_id)
+
+        # Combined loss
+        loss = L_det + beta_cont * L_cont + lambda_T * L_graph
+
+        if not th.isfinite(loss):
+            print(f"  NaN at iter {i}, stopping")
+            break
+
+        loss.backward()
+        opt.step()
+
+        # Record history
+        history["loss"].append(float(loss.item()))
+        history["L_det"].append(float(L_det.item()))
+        history["L_graph"].append(float(L_graph.item()))
+        history["L_cont"].append(float(L_cont.item()) if th.is_tensor(L_cont) else 0.0)
+        history["T_std"].append(float(T.std().item()))
+
+        if i % 20 == 0:
+            stage = "B" if use_pde else "A"
+            L_cont_val = float(L_cont.item()) if th.is_tensor(L_cont) else 0.0
+            print(f"  [{stage}] iter {i:3d}: loss={loss.item():.4f}, L_det={L_det.item():.4f}, "
+                  f"L_cont={L_cont_val:.4f}, L_graph={L_graph.item():.4f}, T_std={T.std().item():.3f}")
+
+    # Final T
+    with th.no_grad():
+        T_est = sigmoid_reparam(u_T, T_min, T_max)
+
+    return T_est, history
+
+
+def fit_T_with_graph(
+    data: dict,
+    cfg: WaveScenarioConfig,
+    lambda_T: float = 0.0,  # Default OFF per Phase 8
+    beta_E: float = 0.1,    # Wave energy loss weight
+    iters: int = 100,
+    lr: float = 0.05,
+    epsilon: float = 0.1,   # Graph filter smoothing
+    warmup_frac: float = 0.3,
+    L_det_guard: float = 2.0,  # Guardrail: reduce beta if L_det > guard * baseline
+):
+    """Fit T parameters with Graph aggregation + Wave Energy supervision."""
+    device = data["s0"].device
+    dtype = data["s0"].dtype
+    N = data["s0"].shape[0]
+
+    s0 = data["s0"]
+    v0 = data["v0"]
+    lane_id = data["lane_id"]
+    leader_idx = data["leader_idx"]
+    x_dets = data["x_dets"]
+    time_idx = data["time_idx_5s"]
+    obs = data["obs_5s"]
+
+    steps = int(cfg.duration_s / cfg.dt)
+    dx = cfg.detector_spacing
+
+    # Build graph aggregator
+    x_dets_t = th.tensor(x_dets, device=device, dtype=dtype)
+    agg = GraphAggregator(x_dets_t, dx, epsilon=epsilon, device=device, dtype=dtype)
+
+    # Precompute observed wave energy
+    V_obs = obs["speed"]  # [K, J]
+    E_obs = compute_wave_energy_direct(V_obs)
+    wave_mask = detect_wave_active_windows(E_obs, quantile=0.7)
+    print(f"  Wave-active windows: {wave_mask.sum().item()}/{len(wave_mask)} time points")
+
+    # Initialize T with prior mean
+    T_min, T_max = cfg.T_min, cfg.T_max
+    u_T = th.nn.Parameter(inverse_sigmoid_reparam(
+        th.full((N,), cfg.T_mean, device=device, dtype=dtype),
+        T_min, T_max
+    ))
+
+    opt = th.optim.Adam([u_T], lr=lr)
+
+    a_max = th.full((N,), cfg.a_max, device=device, dtype=dtype)
+    b = th.full((N,), cfg.b_comfort, device=device, dtype=dtype)
+    v_target = th.full((N,), cfg.v_free, device=device, dtype=dtype)
+
+    history = {
+        "loss": [], "L_det": [], "L_E": [], "L_graph": [],
+        "T_std": [], "E_corr": [],
+    }
+
+    warmup_iters = int(iters * warmup_frac)
+    L_det_baseline = None
+    current_beta_E = beta_E
+
+    print(f"Fitting T with Graph aggregation + Wave Energy:")
+    print(f"  epsilon={epsilon}, beta_E={beta_E}, lambda_T={lambda_T}")
+    print(f"  Stage A (L_det only): iters 0-{warmup_iters-1}")
+    print(f"  Stage B (+ energy): iters {warmup_iters}-{iters-1}")
+
+    for i in range(iters):
+        opt.zero_grad()
+
+        use_energy = (i >= warmup_iters)
+
+        T = sigmoid_reparam(u_T, T_min, T_max)
+
+        S, V, _ = rollout_idm_multilane(
+            s0_init=s0,
+            v0_init=v0,
+            leader_idx=leader_idx,
+            num_steps=steps,
+            dt=cfg.dt,
+            a_max=a_max,
+            b=b,
+            v_target=v_target,
+            s0=cfg.s0,
+            T_headway=T,
+            ghost_v=cfg.ghost_v_base,
+            ghost_gap0=cfg.ghost_gap0,
+        )
+
+        # Graph aggregation
+        macro = agg(S, V)
+        V_sim_full = macro["speed"]  # [T, J]
+        V_sim = V_sim_full[time_idx]  # [K, J]
+
+        # Detector loss (Huber on speed, same as KDE baseline)
+        diff = V_sim - V_obs
+        huber_delta = 1.0
+        abs_diff = th.abs(diff)
+        L_det = th.where(
+            abs_diff <= huber_delta,
+            0.5 * diff ** 2,
+            huber_delta * (abs_diff - 0.5 * huber_delta)
+        ).mean()
+
+        # Record baseline L_det for guardrail
+        if i == warmup_iters - 1:
+            L_det_baseline = L_det.item()
+
+        # Wave energy loss (after warmup)
+        if use_energy:
+            E_sim = compute_wave_energy_direct(V_sim)
+            L_E = wave_energy_loss_correlation(E_sim, E_obs, wave_mask)
+
+            # Guardrail: reduce beta if L_det degrades
+            if L_det_baseline is not None and L_det.item() > L_det_guard * L_det_baseline:
+                current_beta_E = current_beta_E * 0.5
+                if i % 20 == 0:
+                    print(f"  [GUARD] L_det={L_det.item():.4f} > {L_det_guard}x baseline, reducing beta_E to {current_beta_E:.4f}")
+        else:
+            L_E = th.tensor(0.0, device=device, dtype=dtype)
+            E_sim = compute_wave_energy_direct(V_sim)
+
+        # Graph regularization on T (weak or off)
+        if lambda_T > 0:
+            L_graph = laplacian_penalty(T, leader_idx, lane_id)
+        else:
+            L_graph = th.tensor(0.0, device=device, dtype=dtype)
+
+        # Combined loss
+        loss = L_det + current_beta_E * L_E + lambda_T * L_graph
+
+        if not th.isfinite(loss):
+            print(f"  NaN at iter {i}, stopping")
+            break
+
+        loss.backward()
+        opt.step()
+
+        # Compute energy correlation for monitoring
+        with th.no_grad():
+            E_corr = th.corrcoef(th.stack([E_sim.detach(), E_obs]))[0, 1].item()
+
+        # Record history
+        history["loss"].append(float(loss.item()))
+        history["L_det"].append(float(L_det.item()))
+        history["L_E"].append(float(L_E.item()) if use_energy else 0.0)
+        history["L_graph"].append(float(L_graph.item()) if lambda_T > 0 else 0.0)
+        history["T_std"].append(float(T.std().item()))
+        history["E_corr"].append(E_corr)
+
+        if i % 20 == 0:
+            stage = "B" if use_energy else "A"
+            print(f"  [{stage}] iter {i:3d}: loss={loss.item():.4f}, L_det={L_det.item():.4f}, "
+                  f"L_E={L_E.item():.4f}, E_corr={E_corr:.3f}, T_std={T.std().item():.3f}")
+
+    # Final T
+    with th.no_grad():
+        T_est = sigmoid_reparam(u_T, T_min, T_max)
+
+    return T_est, history
+
+
+def fit_T_with_lag_speed(
+    data: dict,
+    cfg: WaveScenarioConfig,
+    lambda_T: float = 0.0,
+    beta_lag: float = 0.1,
+    iters: int = 100,
+    lr: float = 0.05,
+    warmup_frac: float = 0.3,
+    lag_max: int = 6,
+    skip: int = 3,
+    L_det_guard: float = 2.0,
+):
+    """Fit T parameters with Lag-Based Wave Speed supervision."""
+    device = data["s0"].device
+    dtype = data["s0"].dtype
+    N = data["s0"].shape[0]
+
+    s0 = data["s0"]
+    v0 = data["v0"]
+    lane_id = data["lane_id"]
+    leader_idx = data["leader_idx"]
+    xq = data["xq"]
+    x_dets = data["x_dets"]
+    time_idx = data["time_idx_5s"]
+    obs = data["obs_5s"]
+
+    steps = int(cfg.duration_s / cfg.dt)
+
+    # Precompute observed lag/speed
+    V_obs = obs["speed"]
+    # Use early window where vehicles are present
+    wave_mask = th.zeros(V_obs.shape[0], dtype=th.bool, device=device)
+    wave_mask[:8] = True  # First 40s
+
+    result_obs = estimate_wave_speed(
+        V_obs, wave_mask,
+        dx=cfg.detector_spacing, dt_obs=cfg.obs_interval,
+        lag_max=lag_max, skip=skip, conf_threshold=0.0,
+    )
+    lag_obs = result_obs["lag"]
+    valid_obs = th.isfinite(result_obs["speed"]) & (result_obs["lag"] > 0.5)
+    print(f"  Observed wave speeds: {valid_obs.sum().item()} valid pairs")
+    if valid_obs.sum() > 0:
+        speeds_obs = result_obs["speed"][valid_obs]
+        print(f"  Mean obs speed: {speeds_obs.mean():.2f} m/s")
+
+    # Initialize T
+    T_min, T_max = cfg.T_min, cfg.T_max
+    u_T = th.nn.Parameter(inverse_sigmoid_reparam(
+        th.full((N,), cfg.T_mean, device=device, dtype=dtype),
+        T_min, T_max
+    ))
+
+    opt = th.optim.Adam([u_T], lr=lr)
+
+    a_max = th.full((N,), cfg.a_max, device=device, dtype=dtype)
+    b = th.full((N,), cfg.b_comfort, device=device, dtype=dtype)
+    v_target = th.full((N,), cfg.v_free, device=device, dtype=dtype)
+
+    history = {
+        "loss": [], "L_det": [], "L_lag": [], "L_graph": [],
+        "T_std": [], "speed_err": [],
+    }
+
+    warmup_iters = int(iters * warmup_frac)
+    L_det_baseline = None
+    current_beta = beta_lag
+
+    print(f"Fitting T with Lag-Speed supervision:")
+    print(f"  beta_lag={beta_lag}, lambda_T={lambda_T}, skip={skip}")
+    print(f"  Stage A (L_det only): iters 0-{warmup_iters-1}")
+    print(f"  Stage B (+ lag): iters {warmup_iters}-{iters-1}")
+
+    for i in range(iters):
+        opt.zero_grad()
+
+        use_lag = (i >= warmup_iters)
+
+        T = sigmoid_reparam(u_T, T_min, T_max)
+
+        S, V, _ = rollout_idm_multilane(
+            s0_init=s0,
+            v0_init=v0,
+            leader_idx=leader_idx,
+            num_steps=steps,
+            dt=cfg.dt,
+            a_max=a_max,
+            b=b,
+            v_target=v_target,
+            s0=cfg.s0,
+            T_headway=T,
+            ghost_v=cfg.ghost_v_base,
+            ghost_gap0=cfg.ghost_gap0,
+        )
+
+        # Detector observations
+        pred = detector_crosslane_at_times(
+            S=S, V=V, lane_id=lane_id, xq=xq, x_dets=x_dets,
+            time_indices=time_idx, sigma=cfg.sigma, half_window=10.0,
+        )
+        V_sim = pred["speed"]
+
+        # Detector loss
+        L_det = detector_loss(
+            pred=pred, obs=obs,
+            weights={"flow": 1.0, "speed": 0.1},
+            loss_type="huber", huber_delta=1.0,
+        )
+
+        # Record baseline
+        if i == warmup_iters - 1:
+            L_det_baseline = L_det.item()
+
+        # Lag-speed loss (after warmup)
+        if use_lag and valid_obs.sum() > 0:
+            result_sim = estimate_wave_speed(
+                V_sim, wave_mask,
+                dx=cfg.detector_spacing, dt_obs=cfg.obs_interval,
+                lag_max=lag_max, skip=skip, conf_threshold=0.0,
+            )
+            lag_sim = result_sim["lag"]
+
+            # Loss on lag values (more stable than speed)
+            L_lag = lag_loss(lag_sim, lag_obs, valid_obs)
+
+            # Guardrail
+            if L_det_baseline is not None and L_det.item() > L_det_guard * L_det_baseline:
+                current_beta = current_beta * 0.5
+                if i % 20 == 0:
+                    print(f"  [GUARD] reducing beta to {current_beta:.4f}")
+
+            # Speed error for monitoring
+            with th.no_grad():
+                valid_both = valid_obs & th.isfinite(result_sim["speed"])
+                if valid_both.sum() > 0:
+                    speed_err = (result_sim["speed"][valid_both] - result_obs["speed"][valid_both]).abs().mean().item()
+                else:
+                    speed_err = 0.0
+        else:
+            L_lag = th.tensor(0.0, device=device, dtype=dtype)
+            speed_err = 0.0
+
+        # Graph regularization
+        if lambda_T > 0:
+            L_graph = laplacian_penalty(T, leader_idx, lane_id)
+        else:
+            L_graph = th.tensor(0.0, device=device, dtype=dtype)
+
+        # Combined loss
+        loss = L_det + current_beta * L_lag + lambda_T * L_graph
+
+        if not th.isfinite(loss):
+            print(f"  NaN at iter {i}, stopping")
+            break
+
+        loss.backward()
+        opt.step()
+
+        # Record history
+        history["loss"].append(float(loss.item()))
+        history["L_det"].append(float(L_det.item()))
+        history["L_lag"].append(float(L_lag.item()) if use_lag else 0.0)
+        history["L_graph"].append(float(L_graph.item()) if lambda_T > 0 else 0.0)
+        history["T_std"].append(float(T.std().item()))
+        history["speed_err"].append(speed_err)
+
+        if i % 20 == 0:
+            stage = "B" if use_lag else "A"
+            print(f"  [{stage}] iter {i:3d}: loss={loss.item():.4f}, L_det={L_det.item():.4f}, "
+                  f"L_lag={L_lag.item():.4f}, speed_err={speed_err:.2f}, T_std={T.std().item():.3f}")
+
+    # Final T
+    with th.no_grad():
+        T_est = sigmoid_reparam(u_T, T_min, T_max)
+
+    return T_est, history
+
+
 def visualize_results(
     data: dict,
     T_est: th.Tensor,
@@ -508,6 +987,19 @@ def main():
     parser.add_argument("--tau", type=float, default=2.0, help="Softmax temperature for front localization")
     parser.add_argument("--gated-laplacian", action="store_true", help="Use gated Laplacian (allow heterogeneity near front)")
     parser.add_argument("--warmup-frac", type=float, default=0.3, help="Fraction of iters for L_det-only warmup")
+    # PDE constraint arguments
+    parser.add_argument("--pde", action="store_true", help="Use PDE (continuity) constraint")
+    parser.add_argument("--beta-cont", type=float, default=0.001, help="Continuity loss weight")
+    parser.add_argument("--boundary-cells", type=int, default=5, help="Boundary cells to exclude from PDE loss")
+    # Graph aggregation + wave energy arguments
+    parser.add_argument("--graph", action="store_true", help="Use Graph aggregation + Wave Energy supervision")
+    parser.add_argument("--epsilon", type=float, default=0.1, help="Graph filter smoothing parameter")
+    parser.add_argument("--beta-E", type=float, default=0.1, help="Wave energy loss weight")
+    # Lag-speed arguments
+    parser.add_argument("--lag-speed", action="store_true", help="Use Lag-Based Wave Speed supervision")
+    parser.add_argument("--beta-lag", type=float, default=0.1, help="Lag loss weight")
+    parser.add_argument("--lag-max", type=int, default=6, help="Maximum lag to search (steps)")
+    parser.add_argument("--skip", type=int, default=3, help="Detector skip for lag estimation")
     args = parser.parse_args()
 
     device = "cuda" if th.cuda.is_available() else "cpu"
@@ -536,7 +1028,41 @@ def main():
 
     # Fit T
     print("\n2. Fitting T parameters...")
-    if args.wavefront:
+    if args.lag_speed:
+        print("   Using Lag-Based Wave Speed supervision")
+        T_est, history = fit_T_with_lag_speed(
+            data, cfg,
+            lambda_T=args.lambda_T,
+            beta_lag=args.beta_lag,
+            iters=args.iters,
+            lr=args.lr,
+            warmup_frac=args.warmup_frac,
+            lag_max=args.lag_max,
+            skip=args.skip,
+        )
+    elif args.graph:
+        print("   Using Graph aggregation + Wave Energy supervision")
+        T_est, history = fit_T_with_graph(
+            data, cfg,
+            lambda_T=args.lambda_T,
+            beta_E=args.beta_E,
+            iters=args.iters,
+            lr=args.lr,
+            epsilon=args.epsilon,
+            warmup_frac=args.warmup_frac,
+        )
+    elif args.pde:
+        print("   Using PDE (continuity) constraint")
+        T_est, history = fit_T_with_pde(
+            data, cfg,
+            lambda_T=args.lambda_T,
+            beta_cont=args.beta_cont,
+            iters=args.iters,
+            lr=args.lr,
+            boundary_cells=args.boundary_cells,
+            warmup_frac=args.warmup_frac,
+        )
+    elif args.wavefront:
         print("   Using wavefront-aware loss")
         T_est, history = fit_T_with_wavefront(
             data, cfg,
