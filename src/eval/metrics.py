@@ -155,3 +155,60 @@ def parameter_smoothness(
         "std_diff": diff.std() if diff.numel() > 1 else th.tensor(0.0),
         "max_diff": diff.max(),
     }
+
+
+def detector_reconstruction_error(
+    pred: dict[str, th.Tensor],
+    obs: dict[str, th.Tensor],
+) -> dict[str, th.Tensor]:
+    """
+    Compute per-channel reconstruction error.
+
+    Args:
+        pred: dict with 'flow', 'speed' tensors [T, Nd]
+        obs: dict with 'flow', 'speed' tensors [T, Nd]
+
+    Returns:
+        dict with: flow_mse, speed_mse, flow_mae, speed_mae
+    """
+    results = {}
+    for key in ["flow", "speed"]:
+        if key in pred and key in obs:
+            p, o = pred[key], obs[key]
+            valid = th.isfinite(p) & th.isfinite(o)
+            if valid.sum() > 0:
+                diff = p[valid] - o[valid]
+                results[f"{key}_mse"] = (diff**2).mean()
+                results[f"{key}_mae"] = diff.abs().mean()
+            else:
+                results[f"{key}_mse"] = th.tensor(float("nan"))
+                results[f"{key}_mae"] = th.tensor(float("nan"))
+    return results
+
+
+def acceleration_stats(
+    V: th.Tensor,
+    dt: float,
+) -> dict[str, th.Tensor]:
+    """
+    Compute acceleration and jerk statistics for trajectory plausibility.
+
+    Args:
+        V: [T, N] velocity trajectories
+        dt: time step (s)
+
+    Returns:
+        dict with: accel_mean, accel_std, accel_max, jerk_max
+    """
+    # Acceleration: dv/dt
+    accel = (V[1:] - V[:-1]) / dt  # [T-1, N]
+
+    # Jerk: da/dt
+    jerk = (accel[1:] - accel[:-1]) / dt if accel.shape[0] > 1 else th.zeros(1)
+
+    return {
+        "accel_mean": accel.mean(),
+        "accel_std": accel.std(),
+        "accel_max": accel.abs().max(),
+        "jerk_max": jerk.abs().max() if jerk.numel() > 0 else th.tensor(0.0),
+    }

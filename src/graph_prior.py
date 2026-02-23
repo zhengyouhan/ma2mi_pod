@@ -3,6 +3,59 @@ from __future__ import annotations
 import torch as th
 
 
+def compute_platooning_weights(
+    S: th.Tensor,
+    V: th.Tensor,
+    leader_idx: th.Tensor,
+    lane_id: th.Tensor,
+    s0: float = 5.0,
+    vs: float = 2.0,
+    time_idx: int = 0,
+) -> th.Tensor:
+    """
+    Compute soft platooning weights: w_i = exp(-s_i/s0) * exp(-|dv_i|/vs)
+
+    Vehicles close together with similar speeds get higher weight,
+    encouraging parameter similarity within platoons.
+
+    Args:
+        S: [T, N] position trajectories
+        V: [T, N] velocity trajectories
+        leader_idx: [N] leader indices (-1 if no leader)
+        lane_id: [N] lane assignments
+        s0: spacing scale (default 5.0 m)
+        vs: velocity scale (default 2.0 m/s)
+        time_idx: which timestep to evaluate (default 0)
+
+    Returns:
+        [N] detached weights (no gradient through weights)
+    """
+    N = S.shape[1]
+    device, dtype = S.device, S.dtype
+
+    valid = leader_idx >= 0
+    safe_leader = th.clamp(leader_idx, min=0)
+    same_lane = lane_id == lane_id[safe_leader]
+    valid = valid & same_lane
+
+    # Extract state at specified time
+    s = S[time_idx]
+    v = V[time_idx]
+
+    # Compute spacing and relative velocity
+    spacing = th.zeros(N, device=device, dtype=dtype)
+    rel_speed = th.zeros(N, device=device, dtype=dtype)
+
+    spacing[valid] = s[safe_leader[valid]] - s[valid]
+    rel_speed[valid] = v[safe_leader[valid]] - v[valid]
+
+    # Compute weights (only for valid edges)
+    w = th.exp(-spacing.abs() / s0) * th.exp(-rel_speed.abs() / vs)
+    w = w * valid.float()
+
+    return w.detach()
+
+
 def laplacian_penalty(
     param: th.Tensor,
     leader_idx: th.Tensor,

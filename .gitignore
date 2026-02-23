@@ -6,3 +6,6 @@ __pycache__/
 *.pyc
 *.pyo
 .cache/
+itsc.tex
+root.bib
+outputs/*
