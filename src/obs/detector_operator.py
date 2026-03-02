@@ -283,3 +283,67 @@ def detector_crosslane_at_times(
         half_window=half_window,
     )
     return {k: v[time_indices] for k, v in det_ts.items()}
+
+
+def detector_perlane_at_times(
+    S: th.Tensor,
+    V: th.Tensor,
+    lane_id: th.Tensor,
+    xq: th.Tensor,
+    x_dets: list[float],
+    time_indices: th.Tensor,
+    *,
+    sigma: float,
+    half_window: float = 10.0,
+    eps: float = 1e-6,
+) -> dict[str, th.Tensor]:
+    """
+    Per-lane detector outputs at selected time indices (no cross-lane aggregation).
+
+    Each (detector, lane) pair is treated as a separate observation point.
+    Lanes are concatenated along the detector axis:
+      column layout = [det0_lane0, det0_lane1, ..., det0_laneL, det1_lane0, ...]
+
+    Returned shapes are [K, Nd*L], where K = len(time_indices), L = num_lanes.
+    """
+    T, _ = S.shape
+    Nd = len(x_dets)
+    device, dtype = S.device, S.dtype
+    unique_lanes = th.unique(lane_id)
+    L = len(unique_lanes)
+
+    # Per-lane macro at full time resolution: [L, T, Nd]
+    flow_perlane = th.zeros((L, T, Nd), device=device, dtype=dtype)
+    speed_perlane = th.zeros((L, T, Nd), device=device, dtype=dtype)
+
+    for li, lane in enumerate(unique_lanes):
+        mask = lane_id == lane
+        if mask.sum() == 0:
+            continue
+        rho_l, u_l, q_l = micro_to_macro_gaussian(S[:, mask], V[:, mask], xq, sigma=sigma)
+
+        for j, xd in enumerate(x_dets):
+            win = (xq >= xd - half_window) & (xq <= xd + half_window)
+            idx = th.where(win)[0]
+            if idx.numel() == 0:
+                continue
+            flow_perlane[li, :, j] = q_l[:, idx].mean(dim=1)
+            rho_w = rho_l[:, idx].mean(dim=1)
+            speed_perlane[li, :, j] = _soft_conditional(
+                condition_value=rho_w,
+                threshold=eps,
+                safe_value=th.zeros_like(rho_w),
+                computed_value=q_l[:, idx].mean(dim=1) / rho_w.clamp_min(eps),
+                beta=20.0,
+            )
+
+    # Reshape to [T, Nd*L]: interleave lanes per detector
+    # [L, T, Nd] -> [T, Nd, L] -> [T, Nd*L]
+    flow_all = flow_perlane.permute(1, 2, 0).reshape(T, Nd * L)
+    speed_all = speed_perlane.permute(1, 2, 0).reshape(T, Nd * L)
+
+    # Index at observation times
+    return {
+        "flow": flow_all[time_indices],
+        "speed": speed_all[time_indices],
+    }
